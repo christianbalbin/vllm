@@ -200,14 +200,33 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         if self._reasoning_ended_streaming:
             return True
 
-        if self._reasoning_active_streaming or self._pending_marker_streaming:
-            return False
+        # Check the token stream for the end marker before consulting the
+        # frontend streaming-state flags: the scheduler's structured-output
+        # gate (StructuredOutputManager.should_advance) calls this method on a
+        # request-local parser without ever calling
+        # extract_reasoning_streaming, which is the only place those flags are
+        # updated. With thinking_mode="enabled",
+        # ``_reasoning_active_streaming`` starts True and would otherwise gate
+        # detection off forever, so grammar constraints never engage
+        # (structured output is silently ignored).
+        #
+        # Ordering matters, not mere containment: ``input_ids`` spans prompt
+        # and output, and the chat template's <thinking_instructions> block
+        # embeds literal marker text in the prompt. Reasoning has ended only
+        # when the last end marker follows the last start marker (the
+        # template's trailing ``<mm:think>`` prefill keeps this False until
+        # the model really closes the block) - which is exactly
+        # ``is_reasoning_end``.
+        if self.is_reasoning_end(input_ids):
+            return True
 
         delta_ids = tuple(delta_ids)
         if self._contains_token_sequence(delta_ids, self._end_token_ids):
             return True
-        if self._contains_token_sequence(input_ids, self._end_token_ids):
-            return True
+
+        if self._reasoning_active_streaming or self._pending_marker_streaming:
+            return False
+
         if self._initial_in_reasoning:
             return False
         if self._ends_with_token_sequence_prefix(input_ids, self._start_token_ids):

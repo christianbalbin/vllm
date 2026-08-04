@@ -548,6 +548,7 @@ class Worker(WorkerBase):
         )
 
         self.total_consumed = profile_result.total_consumed
+        self.transient_peak_headroom = profile_result.transient_peak_headroom
         self.peak_activation_memory = (
             profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
         )
@@ -899,7 +900,15 @@ class Worker(WorkerBase):
                 - free_memory
                 - self.model_runner.kv_cache_committed_bytes
             )
-            post_warmup_available = int(self.requested_memory) - non_kv_used_memory
+            # Honor the utilization budget without claiming more than is
+            # free: the budget is a fraction of *total* memory, so it can
+            # exceed what was free at the initial snapshot (this worker's
+            # context and comm buffers were already resident) -- harmless at
+            # the default utilization, an over-commitment as it approaches 1.
+            post_warmup_available = min(
+                int(self.requested_memory) - non_kv_used_memory,
+                free_memory + self.model_runner.kv_cache_committed_bytes,
+            )
             warmup_memory_bytes = max(
                 cuda_graph_memory_bytes,
                 int(self.available_kv_cache_memory_bytes) - post_warmup_available,
@@ -941,6 +950,7 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
             warmup_memory=warmup_memory_bytes,
+            transient_peak_headroom=getattr(self, "transient_peak_headroom", 0),
         )
 
     def reset_mm_cache(self) -> None:

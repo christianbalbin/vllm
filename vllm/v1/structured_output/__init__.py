@@ -420,9 +420,13 @@ class StructuredOutputManager:
                 # tokens right away, but the step still contains reasoning
                 # content up to and including the end marker. Record where
                 # it ends so trim_reasoning_for_advance() can drop it.
-                structured_req.reasoning_end_token_index = (
-                    self._find_reasoning_end_index(reasoner, all_token_ids, start)
-                )
+                # precommit_filter_tokens usually stored the exact index
+                # already (it runs earlier in update_from_output); fall
+                # back to the scan only when it did not run.
+                if structured_req.reasoning_end_token_index is None:
+                    structured_req.reasoning_end_token_index = (
+                        self._find_reasoning_end_index(reasoner, all_token_ids, start)
+                    )
                 return True
 
         return False
@@ -558,6 +562,15 @@ class StructuredOutputManager:
         )
         if split_idx is None:
             return new_token_ids, 0
+
+        # Record the absolute boundary position for the same-step FSM
+        # advance (should_advance -> trim_reasoning_for_advance). This is
+        # exact: prior_token_ids does not yet include new_token_ids, so
+        # the marker's absolute index is prior length + batch offset.
+        # _find_reasoning_end_index cannot recover it later - it scans
+        # from a spec-decode-adjusted offset that may already lie past
+        # the marker, mis-trimming the advance.
+        structured_req.reasoning_end_token_index = len(prior_token_ids) + split_idx
 
         post_boundary = new_token_ids[split_idx + 1 :]
         if not post_boundary:

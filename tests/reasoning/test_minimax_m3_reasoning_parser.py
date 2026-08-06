@@ -473,9 +473,7 @@ def test_reasoning_end_streaming_scheduler_pattern_enabled_mode():
     token_ids = tokenizer.encode(
         'some reasoning</mm:think>{"a": 1}', add_special_tokens=False
     )
-    end_marker_index = token_ids.index(
-        tokenizer.convert_tokens_to_ids("</mm:think>")
-    )
+    end_marker_index = token_ids.index(tokenizer.convert_tokens_to_ids("</mm:think>"))
 
     all_ids: list[int] = []
     fired_at = None
@@ -496,9 +494,7 @@ def test_reasoning_end_streaming_scheduler_pattern_spec_decode_window():
     token_ids = tokenizer.encode(
         'thinking</mm:think>{"a": 1}', add_special_tokens=False
     )
-    end_marker_index = token_ids.index(
-        tokenizer.convert_tokens_to_ids("</mm:think>")
-    )
+    end_marker_index = token_ids.index(tokenizer.convert_tokens_to_ids("</mm:think>"))
 
     window = 4
     all_ids: list[int] = []
@@ -544,3 +540,37 @@ def test_reasoning_end_streaming_ignores_prompt_scaffolding_markers():
             fired_at = i
 
     assert fired_at == end_offset
+
+
+def test_reasoning_end_streaming_incremental_scan_split_marker():
+    """Scheduler pattern with a tokenizer that splits markers into many
+    tokens: the incremental history scan must still detect a marker that
+    straddles successive scan windows, and must not fire early."""
+    tokenizer = SplitMiniMaxM3Tokenizer()
+    parser = MiniMaxM3ReasoningParser(
+        tokenizer, chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    generated = tokenizer.encode('r</mm:think>{"a": 1}', add_special_tokens=False)
+    # Marker is split into one token per character; it completes at the
+    # index of its final '>' character.
+    end_offset = len("r</mm:think>") - 1
+
+    all_ids: list[int] = []
+    fired_at = None
+    for i, token in enumerate(generated):
+        all_ids.append(token)
+        if parser.is_reasoning_end_streaming(all_ids, [token]) and fired_at is None:
+            fired_at = i
+    assert fired_at == end_offset
+
+
+def test_reasoning_end_streaming_scan_cache_resets_on_new_stream():
+    """Reusing a parser on a shorter, fresh token stream must reset the
+    incremental scan cache rather than reuse stale marker positions."""
+    parser, tokenizer = make_parser(chat_template_kwargs={"thinking_mode": "enabled"})
+    first = tokenizer.encode("abc</mm:think>x", add_special_tokens=False)
+    assert parser.is_reasoning_end_streaming(first, first[-1:]) is True
+
+    fresh = tokenizer.encode("ab", add_special_tokens=False)
+    parser._reasoning_ended_streaming = False
+    assert parser.is_reasoning_end_streaming(fresh, fresh[-1:]) is False

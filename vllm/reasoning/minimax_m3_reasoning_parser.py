@@ -46,6 +46,12 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         self._pending_marker_streaming = False
         self._last_streaming_delta_token_ids: tuple[int, ...] | None = None
         self._last_streaming_content_token_ids: list[int] | None = None
+        # Incremental marker-scan cache for _reasoning_end_in_history.
+        # The parser is request-local and its token history is append-only,
+        # so each call only needs to scan tokens it has not seen yet.
+        self._history_scan_pos = 0
+        self._history_last_start_pos = -1
+        self._history_last_end_pos = -1
 
     def _encode_text(self, text: str) -> list[int]:
         try:
@@ -194,6 +200,39 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
 
         return reasoning, (content_before + content_after) or None
 
+    def _reasoning_end_in_history(self, input_ids: Sequence[int]) -> bool:
+        """Incremental equivalent of ``is_reasoning_end(input_ids)``.
+
+        Tracks the last-seen start/end marker positions across calls,
+        scanning only tokens beyond the previous scan position (plus a
+        marker-length overlap for markers straddling the line). If the
+        sequence shrank since the last call - a new stream reusing the
+        parser - the cache resets and the scan restarts from zero.
+        """
+        n = len(input_ids)
+        if n < self._history_scan_pos:
+            self._history_scan_pos = 0
+            self._history_last_start_pos = -1
+            self._history_last_end_pos = -1
+        overlap = max(len(self._start_token_ids), len(self._end_token_ids)) - 1
+        begin = max(0, self._history_scan_pos - overlap)
+        window = input_ids[begin:n] if begin else input_ids
+        start_pos = self._rfind_token_sequence(window, self._start_token_ids)
+        if start_pos >= 0:
+            self._history_last_start_pos = max(
+                self._history_last_start_pos, begin + start_pos
+            )
+        end_pos = self._rfind_token_sequence(window, self._end_token_ids)
+        if end_pos >= 0:
+            self._history_last_end_pos = max(
+                self._history_last_end_pos, begin + end_pos
+            )
+        self._history_scan_pos = n
+        return (
+            self._history_last_end_pos >= 0
+            and self._history_last_end_pos > self._history_last_start_pos
+        )
+
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
@@ -215,9 +254,10 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         # embeds literal marker text in the prompt. Reasoning has ended only
         # when the last end marker follows the last start marker (the
         # template's trailing ``<mm:think>`` prefill keeps this False until
-        # the model really closes the block) - which is exactly
-        # ``is_reasoning_end``.
-        if self.is_reasoning_end(input_ids):
+        # the model really closes the block) - the same predicate as
+        # ``is_reasoning_end``, evaluated incrementally so per-token calls
+        # from the scheduler stay O(new tokens) instead of O(history).
+        if self._reasoning_end_in_history(input_ids):
             return True
 
         delta_ids = tuple(delta_ids)

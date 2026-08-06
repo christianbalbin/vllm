@@ -15,7 +15,6 @@ from vllm.v1.structured_output.backend_guidance import GuidanceBackend
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
-    StructuredOutputOptions,
 )
 from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
 
@@ -402,18 +401,21 @@ class StructuredOutputManager:
         ):
             structured_req.reasoning_ended = True
 
-            # Reasoning just ended this step. Defer FSM advance until the next
-            # pass (see reasoning_ended check above) for JSON/regex/choice/grammar:
-            # advancing on the closing boundary token can accept tokens that still
-            # belong to the reasoning stream. Structural tags are the only safe
-            # same-step exception: they model phased output (e.g. thinking tag ->
-            # answer tag), and speculative decoding must run grammar.validate_tokens
-            # on draft tokens produced immediately after that transition.
-            if (
-                self.vllm_config.speculative_config is not None
-                and structured_req.structured_output_key[0]
-                == StructuredOutputOptions.STRUCTURAL_TAG
-            ):
+            # Reasoning just ended this step. With speculative decoding the
+            # step usually carries sampled tokens PAST the boundary marker
+            # (draft/bonus positions sampled before the mask engaged). Those
+            # tokens are committed to the request, so the grammar must
+            # advance over them in the same step - otherwise the next step's
+            # bitmask starts from the FSM root while the visible text already
+            # contains the model's own grammar opening, duplicating it (e.g.
+            # '{"' + '{...}' for JSON). trim_reasoning_for_advance() drops
+            # the reasoning content up to and including the marker, and the
+            # scheduler's pre-commit filter (precommit_filter_tokens)
+            # guarantees the surviving post-boundary tokens are
+            # grammar-valid, so accept_tokens cannot fail. Without spec
+            # decode there is at most one token per step and the marker is
+            # the last token, so deferring to the next pass remains correct.
+            if self.vllm_config.speculative_config is not None:
                 # The scheduler will advance the grammar with this step's
                 # tokens right away, but the step still contains reasoning
                 # content up to and including the end marker. Record where
@@ -471,6 +473,102 @@ class StructuredOutputManager:
         if num_reasoning <= 0:
             return new_token_ids
         return new_token_ids[num_reasoning:]
+
+    def _find_reasoning_end_in_tokens(
+        self,
+        reasoner: "ReasoningParser",
+        token_ids: list[int],
+        prior_token_ids: list[int],
+    ) -> int | None:
+        """Return the index in ``token_ids`` at which the reasoning-end
+        marker completes, or ``None`` if it does not complete inside this
+        batch.
+
+        Scans progressively longer prefixes via the reasoner's
+        ``is_reasoning_end_streaming`` so that multi-token markers which can
+        straddle the prior-context / current-batch line are still detected.
+        ``prior_token_ids`` are tokens already committed to the request.
+
+        Unlike :meth:`_find_reasoning_end_index`, which conservatively
+        falls back to the final index, this returns ``None`` when the
+        marker does not complete in the batch - the pre-commit filter
+        must only act when the boundary is unambiguously inside
+        ``token_ids``.
+        """
+        buf = list(prior_token_ids)
+        for i, token in enumerate(token_ids):
+            buf.append(token)
+            if reasoner.is_reasoning_end_streaming(buf, [token]):
+                return i
+        return None
+
+    def precommit_filter_tokens(
+        self,
+        request: "Request",
+        new_token_ids: list[int],
+    ) -> tuple[list[int], int]:
+        """Pre-commit grammar filter for the reasoning-end boundary step.
+
+        When reasoning ends mid-batch under speculative decoding, the
+        verifier may have sampled bonus/draft tokens for positions past the
+        boundary WITHOUT the grammar mask engaged: the mask is gated on
+        ``reasoning_ended`` (see :meth:`should_fill_bitmask`), which only
+        flips True after the boundary is observed - i.e. after this step's
+        tokens were sampled.
+
+        Without this filter, grammar-invalid post-boundary tokens are
+        committed to the request and later fed to ``accept_tokens`` by the
+        should_advance -> trim_reasoning_for_advance path, desyncing the
+        FSM from the visible text (or erroring the advance).
+
+        Mechanism: dry-run grammar validation
+        (:meth:`StructuredOutputGrammar.validate_tokens` - never advances
+        the matcher) on the post-boundary slice; the caller truncates
+        ``new_token_ids`` and adjusts ``num_computed_tokens`` /
+        ``num_output_placeholders`` by the rejected count (mirroring the
+        verifier-rejected spec-token bookkeeping), so the next step
+        re-samples from the truncated position with the mask engaged.
+
+        Returns ``(filtered_new_token_ids, num_rejected)``.
+        """
+        if self.vllm_config.speculative_config is None:
+            # Without spec decode there is at most one sampled token per
+            # step, so there are never post-boundary bonus tokens.
+            return new_token_ids, 0
+        if not request.use_structured_output:
+            return new_token_ids, 0
+        reasoner = self._get_reasoner(request)
+        if reasoner is None or self.enable_in_reasoning:
+            return new_token_ids, 0
+        structured_req = request.structured_output_request
+        if structured_req is None or structured_req.grammar is None:
+            return new_token_ids, 0
+        # Only act on the boundary step. Once reasoning has ended in a
+        # prior step the mask was correctly applied at sample time, and
+        # the post-commit accept path already handles validation.
+        if structured_req.reasoning_ended:
+            return new_token_ids, 0
+
+        # Pre-commit: request.all_token_ids does NOT yet include
+        # new_token_ids (we run before _update_request_with_output), so
+        # all_token_ids IS the prior context.
+        prior_token_ids = list(request.all_token_ids or [])
+        split_idx = self._find_reasoning_end_in_tokens(
+            reasoner, new_token_ids, prior_token_ids
+        )
+        if split_idx is None:
+            return new_token_ids, 0
+
+        post_boundary = new_token_ids[split_idx + 1 :]
+        if not post_boundary:
+            return new_token_ids, 0
+
+        grammar = structured_req.grammar
+        validated = grammar.validate_tokens(post_boundary)
+        num_rejected = len(post_boundary) - len(validated)
+        if num_rejected == 0:
+            return new_token_ids, 0
+        return new_token_ids[: split_idx + 1] + list(validated), num_rejected
 
     def clear_backend(self) -> None:
         if self.backend is not None:

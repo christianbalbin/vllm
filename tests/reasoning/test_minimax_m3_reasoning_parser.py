@@ -605,3 +605,169 @@ def test_reasoning_end_streaming_rejected_draft_marker_not_cached():
     # And the genuine marker must still be detected when it arrives.
     real2 = real + [end_id]
     assert parser.is_reasoning_end_streaming(real2, [end_id]) is True
+
+
+# ── Implicit reasoning end: tool call opened inside the think block ────────
+#
+# MiniMax M3 sometimes drafts its answer inside <mm:think> and emits a
+# complete native tool call there without ever sampling </mm:think>. Without
+# recovery the round ends `stop` with empty content and no tool calls.
+
+TOOL_CALL_START = "]<]minimax[>[<tool_call>"
+TOOL_BLOCK = (
+    TOOL_CALL_START + '\n]<]minimax[>[<invoke name="render_chart">'
+    "]<]minimax[>[<version>1]<]minimax[>[</version>"
+    "]<]minimax[>[</invoke>]<]minimax[>[</tool_call>"
+)
+
+
+class ToolMarkupMiniMaxM3Tokenizer(MiniMaxM3Tokenizer):
+    """Adds M3's tool-markup special tokens (namespace marker + tag tokens)."""
+
+    special_tokens = MiniMaxM3Tokenizer.special_tokens + (
+        "]<]minimax[>[",
+        "<tool_call>",
+        "</tool_call>",
+    )
+
+
+def make_tool_markup_parser(
+    chat_template_kwargs: dict[str, str] | None = None,
+) -> tuple[MiniMaxM3ReasoningParser, MiniMaxM3Tokenizer]:
+    tokenizer = ToolMarkupMiniMaxM3Tokenizer()
+    return (
+        MiniMaxM3ReasoningParser(tokenizer, chat_template_kwargs=chat_template_kwargs),
+        tokenizer,
+    )
+
+
+def test_nonstreaming_unclosed_block_recovers_tool_call():
+    parser, _ = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    request = ChatCompletionRequest(messages=[], model="test-model")
+
+    reasoning, content = parser.extract_reasoning(
+        "let me draft:\n\n## Snapshot\nprose" + TOOL_BLOCK, request
+    )
+
+    # The sentinel and everything after it become content, so the tool parser
+    # sees the block exactly as it would after an explicit close.
+    assert reasoning == "let me draft:\n\n## Snapshot\nprose"
+    assert content == TOOL_BLOCK
+
+
+def test_nonstreaming_explicit_close_with_tool_call_unchanged():
+    parser, _ = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    request = ChatCompletionRequest(messages=[], model="test-model")
+
+    reasoning, content = parser.extract_reasoning(
+        "plan</mm:think>## Snapshot" + TOOL_BLOCK, request
+    )
+
+    assert reasoning == "plan"
+    assert content == "## Snapshot" + TOOL_BLOCK
+
+
+def test_nonstreaming_unclosed_block_without_sentinel_stays_reasoning():
+    parser, _ = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    request = ChatCompletionRequest(messages=[], model="test-model")
+
+    reasoning, content = parser.extract_reasoning("thinking, no tool call", request)
+
+    assert reasoning == "thinking, no tool call"
+    assert content is None
+
+
+def test_streaming_unclosed_block_routes_tool_call_to_content():
+    parser, tokenizer = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+
+    reasoning, content, end_states = run_streaming(
+        parser,
+        tokenizer,
+        ["drafting:", "\n## Snapshot", TOOL_CALL_START, '\n]<]minimax[>[<invoke n="c">'],
+    )
+
+    assert reasoning == "drafting:\n## Snapshot"
+    assert content == TOOL_CALL_START + '\n]<]minimax[>[<invoke n="c">'
+    # Reasoning ends on the sentinel delta, which is what flips the frontend
+    # into its tool-call phase.
+    assert end_states == [False, False, True, True]
+
+
+def test_streaming_split_sentinel_is_withheld_from_reasoning():
+    """A sentinel straddling deltas must never be emitted as reasoning."""
+    parser, tokenizer = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+
+    reasoning, content, _ = run_streaming(
+        parser, tokenizer, ["think", *list(TOOL_CALL_START), "rest"]
+    )
+
+    assert reasoning == "think"
+    assert content == TOOL_CALL_START + "rest"
+
+
+def test_streaming_implicit_end_yields_content_ids_from_sentinel():
+    parser, tokenizer = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    delta_ids = tokenizer.encode(TOOL_CALL_START, add_special_tokens=False)
+
+    parser.extract_reasoning_streaming(
+        previous_text="think",
+        current_text="think" + TOOL_CALL_START,
+        delta_text=TOOL_CALL_START,
+        previous_token_ids=tokenizer.encode("think", add_special_tokens=False),
+        current_token_ids=tokenizer.encode(
+            "think" + TOOL_CALL_START, add_special_tokens=False
+        ),
+        delta_token_ids=delta_ids,
+    )
+
+    # Content ids include the block's own opening tag.
+    assert parser.extract_content_ids(delta_ids) == delta_ids
+
+
+def test_implicit_reasoning_end_disabled_for_grammar_gate():
+    """The structured-output manager clears the flag on its own instance.
+
+    An implicit end fires on content the model has *already* emitted, so
+    advancing the FSM there would leave the grammar a step behind the visible
+    text (trim_reasoning_for_advance drops the marker as non-content).
+    """
+    parser, tokenizer = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    parser.allow_implicit_reasoning_end = False
+
+    _, _, end_states = run_streaming(parser, tokenizer, ["think", TOOL_CALL_START])
+
+    assert end_states == [False, False]
+    # An explicit marker still ends reasoning for the grammar gate.
+    end_id = tokenizer.convert_tokens_to_ids("</mm:think>")
+    assert parser.is_reasoning_end_streaming([end_id], [end_id]) is True
+
+
+def test_implicit_end_not_inferred_from_prompt_tool_markup():
+    """is_reasoning_end must ignore tool markup replayed by the prompt.
+
+    A multi-turn prompt contains earlier turns' tool calls; inferring an end
+    from those would engage the grammar before the model has thought at all.
+    """
+    parser, tokenizer = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    prompt_ids = tokenizer.encode(
+        "earlier turn " + TOOL_BLOCK, add_special_tokens=False
+    )
+
+    assert parser.is_reasoning_end(prompt_ids) is False
+    assert parser.is_reasoning_end_streaming(prompt_ids, prompt_ids) is False

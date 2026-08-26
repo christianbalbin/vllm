@@ -11,6 +11,12 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
+# Opening sentinel of an M3 native tool call. Keep in sync with
+# ``vllm.tool_parsers.minimax_m3_tool_parser._TOOL_CALL_START`` (and the Rust
+# parser's own token): this parser only needs to recognize the marker, never
+# to parse the block, which stays the tool parser's job.
+_TOOL_CALL_START = "]<]minimax[>[<tool_call>"
+
 
 class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for MiniMax M3 explicit thinking blocks.
@@ -39,8 +45,15 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         super().__init__(tokenizer, *args, **kwargs)
         self._start_token_ids = self._encode_marker(self.start_token)
         self._end_token_ids = self._encode_marker(self.end_token)
+        self._tool_call_start_token_ids = self._encode_marker(_TOOL_CALL_START)
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         self._initial_in_reasoning = chat_kwargs.get("thinking_mode") == "enabled"
+        # Implicit reasoning end: see _segments_without_explicit_end. Owners of
+        # an instance that drives grammar advancement (the structured-output
+        # manager) turn this off - an implicit end must never move the FSM,
+        # because the sentinel it fires on is already-emitted grammar content.
+        self.allow_implicit_reasoning_end = True
+        self._implicit_content_started = False
         self._reasoning_ended_streaming = False
         self._reasoning_active_streaming = self._initial_in_reasoning
         self._pending_marker_streaming = False
@@ -132,6 +145,46 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         return text
 
     @staticmethod
+    def _split_at_tool_call_sentinel(text: str) -> tuple[str, str] | None:
+        """Split ``text`` at the first tool-call sentinel, or None if absent."""
+        index = text.find(_TOOL_CALL_START)
+        if index < 0:
+            return None
+        return text[:index], text[index:]
+
+    def _segments_without_explicit_end(
+        self, reasoning: str
+    ) -> tuple[str | None, str | None, bool]:
+        """Segment an unclosed reasoning block, recovering a tool call in it.
+
+        MiniMax M3 sometimes drafts its answer *inside* the think block and
+        emits a complete native tool call there without ever sampling
+        ``</mm:think>`` (~1 in 3 long-context tool rounds as of 2026-08). The
+        round then ends with all of the answer and the tool call attributed to
+        reasoning, so the client sees ``finish_reason: stop`` with empty
+        content and no tool calls.
+
+        The tool-call sentinel is special-token markup that can only belong to
+        content, so its first occurrence implicitly ends reasoning: text
+        before it stays reasoning, the sentinel onward becomes content and
+        reaches the tool parser exactly as it would after an explicit close.
+        The drafted prose is deliberately left in reasoning - the model
+        regenerates it in the round after the tool result, as it does for any
+        normal tool-first round.
+
+        Returns ``(reasoning, content, implicit_end)``.
+        """
+        split = self._split_at_tool_call_sentinel(reasoning)
+        if split is not None:
+            head, tail = split
+            return head or None, tail, True
+        # Withhold a partial marker so a sentinel straddling two deltas is
+        # never emitted as reasoning and then retracted.
+        head = self._strip_partial_marker_suffix(reasoning, self.end_token)
+        head = self._strip_partial_marker_suffix(head, _TOOL_CALL_START)
+        return head or None, None, False
+
+    @staticmethod
     def _visible_delta(previous: str | None, current: str | None) -> str | None:
         if not current:
             return None
@@ -142,36 +195,38 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
             return delta or None
         return current
 
-    def _visible_segments(self, text: str) -> tuple[str | None, str | None]:
+    def _visible_segments(self, text: str) -> tuple[str | None, str | None, bool]:
+        """Return ``(reasoning, content, implicit_end)`` for cumulative text."""
         if not text:
-            return None, None
+            return None, None, False
 
         if not self._initial_in_reasoning:
             if self.end_token.startswith(text) and len(text) < len(self.end_token):
-                return None, None
+                return None, None, False
             if text.startswith(self.end_token):
                 text = text[len(self.end_token) :]
                 if not text:
-                    return None, None
+                    return None, None, False
 
         if self._initial_in_reasoning and self.start_token not in text:
             reasoning, end, content = text.partition(self.end_token)
             if end:
-                return reasoning or None, content or None
-            reasoning = self._strip_partial_marker_suffix(reasoning, self.end_token)
-            return reasoning or None, None
+                return reasoning or None, content or None, False
+            return self._segments_without_explicit_end(reasoning)
 
         if self.start_token not in text:
             content = self._strip_partial_marker_suffix(text, self.start_token)
-            return None, content or None
+            return None, content or None, False
 
         content_before, _, after_start = text.partition(self.start_token)
         reasoning, end, content_after = after_start.partition(self.end_token)
         if end:
-            return reasoning or None, (content_before + content_after) or None
+            return reasoning or None, (content_before + content_after) or None, False
 
-        reasoning = self._strip_partial_marker_suffix(reasoning, self.end_token)
-        return reasoning or None, content_before or None
+        head, tail, implicit_end = self._segments_without_explicit_end(reasoning)
+        if implicit_end:
+            return head, (content_before + (tail or "")) or None, True
+        return head, content_before or None, False
 
     def extract_reasoning(
         self,
@@ -187,7 +242,12 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         if self._initial_in_reasoning and self.start_token not in model_output:
             reasoning, end, content = model_output.partition(self.end_token)
             if not end:
-                return model_output, None
+                # Unclosed think block: recover a tool call drafted inside it
+                # (see _segments_without_explicit_end).
+                split = self._split_at_tool_call_sentinel(reasoning)
+                if split is None:
+                    return model_output, None
+                return split[0] or None, split[1]
             return reasoning, content or None
 
         if self.start_token not in model_output:
@@ -196,7 +256,10 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         content_before, _, after_start = model_output.partition(self.start_token)
         reasoning, end, content_after = after_start.partition(self.end_token)
         if not end:
-            return reasoning, content_before or None
+            split = self._split_at_tool_call_sentinel(reasoning)
+            if split is None:
+                return reasoning, content_before or None
+            return split[0] or None, (content_before + split[1]) or None
 
         return reasoning, (content_before + content_after) or None
 
@@ -262,6 +325,16 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         if self._reasoning_ended_streaming:
             return True
 
+        # An implicit end (tool-call sentinel emitted inside the think block)
+        # is derived from the streaming text state, which only
+        # extract_reasoning_streaming maintains. The structured-output
+        # manager's request-local parser never calls that method, so this
+        # never fires on the grammar-advance path even before that owner
+        # clears ``allow_implicit_reasoning_end`` - the prompt it scans also
+        # replays earlier turns' tool markup, which must never end reasoning.
+        if self.allow_implicit_reasoning_end and self._implicit_content_started:
+            return True
+
         # Check the token stream for the end marker before consulting the
         # frontend streaming-state flags: the scheduler's structured-output
         # gate (StructuredOutputManager.should_advance) calls this method on a
@@ -314,6 +387,16 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         if end_index >= 0:
             return input_ids[end_index + len(self._end_token_ids) :]
 
+        # No explicit close: if a tool call was opened inside the think block,
+        # content starts at (and includes) the sentinel, so the tool parser
+        # receives the block's own opening tag.
+        if self.allow_implicit_reasoning_end and self._implicit_content_started:
+            sentinel_index = self._rfind_token_sequence(
+                input_ids, self._tool_call_start_token_ids
+            )
+            if sentinel_index >= 0:
+                return input_ids[sentinel_index:]
+
         has_start = self._contains_token_sequence(input_ids, self._start_token_ids)
         if self._initial_in_reasoning and not has_start:
             return []
@@ -338,11 +421,22 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
             self._reasoning_ended_streaming = False
             self._reasoning_active_streaming = self._initial_in_reasoning
             self._pending_marker_streaming = False
+            self._implicit_content_started = False
             self._last_streaming_delta_token_ids = None
             self._last_streaming_content_token_ids = None
-        previous_reasoning, previous_content = self._visible_segments(previous_text)
-        current_reasoning, current_content = self._visible_segments(current_text)
-        if self.end_token in current_text or current_content is not None:
+        previous_reasoning, previous_content, _ = self._visible_segments(previous_text)
+        current_reasoning, current_content, implicit_end = self._visible_segments(
+            current_text
+        )
+        if implicit_end:
+            self._implicit_content_started = True
+        # An implicit end is tracked separately: ``_reasoning_ended_streaming``
+        # means the model really closed the block, and flipping it here would
+        # claim a reasoning end this parser cannot substantiate from the token
+        # stream alone (the marker is simply absent).
+        if self.end_token in current_text or (
+            current_content is not None and not implicit_end
+        ):
             self._reasoning_ended_streaming = True
             self._reasoning_active_streaming = False
             self._pending_marker_streaming = False
@@ -360,7 +454,7 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
             )
         reasoning = self._visible_delta(previous_reasoning, current_reasoning)
         content = self._visible_delta(previous_content, current_content)
-        if self._reasoning_ended_streaming:
+        if self._reasoning_ended_streaming or self._implicit_content_started:
             self._last_streaming_delta_token_ids = tuple(delta_token_ids)
             self._last_streaming_content_token_ids = self._content_suffix_token_ids(
                 delta_text, delta_token_ids, content

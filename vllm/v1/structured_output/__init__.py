@@ -105,10 +105,20 @@ class StructuredOutputManager:
             # Lazily build the request-local parser so the structured-output
             # gate observes the same template kwargs used by the frontend.
             parser_kwargs = structured_req.reasoning_parser_kwargs or {}
-            structured_req.reasoner = self.reasoner_cls(
+            reasoner = self.reasoner_cls(
                 tokenizer=self.tokenizer,
                 **parser_kwargs,
             )
+            # This instance exists only to gate grammar advancement, so it must
+            # report a reasoning end only where the FSM can legally start: at
+            # an explicit end marker, which trim_reasoning_for_advance drops as
+            # non-content. A parser that also infers an *implicit* end from
+            # already-emitted content (MiniMax M3 recovers a tool call opened
+            # inside its think block) would have the trim swallow that content
+            # and leave the FSM a step behind the visible text.
+            if hasattr(reasoner, "allow_implicit_reasoning_end"):
+                reasoner.allow_implicit_reasoning_end = False
+            structured_req.reasoner = reasoner
         return structured_req.reasoner
 
     def grammar_init(self, request: "Request") -> None:

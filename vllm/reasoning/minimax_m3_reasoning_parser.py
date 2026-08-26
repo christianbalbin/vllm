@@ -5,7 +5,10 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.logger import init_logger
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -145,6 +148,22 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         return text
 
     @staticmethod
+    def _log_recovery(path: str, reasoning_chars: int) -> None:
+        """Record that a tool call was recovered from an unclosed think block.
+
+        Counts only - never the reasoning text, the tool arguments, or any
+        prompt content. Fires at most once per request, so the rate at which
+        the model skips its own ``</mm:think>`` stays measurable even though a
+        recovered round is otherwise indistinguishable from a healthy one.
+        """
+        logger.info(
+            "m3_implicit_reasoning_end: recovered a tool call opened inside an "
+            "unclosed reasoning block (path=%s, reasoning_chars=%d)",
+            path,
+            reasoning_chars,
+        )
+
+    @staticmethod
     def _split_at_tool_call_sentinel(text: str) -> tuple[str, str] | None:
         """Split ``text`` at the first tool-call sentinel, or None if absent."""
         index = text.find(_TOOL_CALL_START)
@@ -177,6 +196,8 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         split = self._split_at_tool_call_sentinel(reasoning)
         if split is not None:
             head, tail = split
+            if not self._implicit_content_started:
+                self._log_recovery("streaming", len(head))
             return head or None, tail, True
         # Withhold a partial marker so a sentinel straddling two deltas is
         # never emitted as reasoning and then retracted.
@@ -247,6 +268,7 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
                 split = self._split_at_tool_call_sentinel(reasoning)
                 if split is None:
                     return model_output, None
+                self._log_recovery("non-streaming", len(split[0]))
                 return split[0] or None, split[1]
             return reasoning, content or None
 
@@ -259,6 +281,7 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
             split = self._split_at_tool_call_sentinel(reasoning)
             if split is None:
                 return reasoning, content_before or None
+            self._log_recovery("non-streaming", len(split[0]))
             return split[0] or None, (content_before + split[1]) or None
 
         return reasoning, (content_before + content_after) or None

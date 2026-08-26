@@ -791,3 +791,47 @@ def test_nonstreaming_truncated_tool_call_stays_in_reasoning():
 
     assert content is None
     assert reasoning == truncated
+
+
+def test_adaptive_mode_unclosed_block_recovers_tool_call():
+    """The recovery also covers a model-opened block (thinking_mode adaptive).
+
+    Here the start marker is generated rather than prefilled, so the branch
+    that splits on ``<mm:think>`` handles the unclosed case, and any content
+    emitted before the block stays in front of the recovered tool call.
+    """
+    parser, tokenizer = make_tool_markup_parser()
+    request = ChatCompletionRequest(messages=[], model="test-model")
+
+    reasoning, content = parser.extract_reasoning(
+        "<mm:think>draft" + TOOL_BLOCK, request
+    )
+    assert reasoning == "draft"
+    assert content == TOOL_BLOCK
+
+    parser, tokenizer = make_tool_markup_parser()
+    reasoning, content, end_states = run_streaming(
+        parser, tokenizer, ["<mm:think>", "draft", TOOL_CALL_START, "rest"]
+    )
+    assert reasoning == "draft"
+    assert content == TOOL_CALL_START + "rest"
+    assert end_states == [False, False, True, True]
+
+
+def test_nonstreaming_explicit_close_after_sentinel_wins():
+    """Pins the documented streaming/non-streaming divergence.
+
+    Non-streaming sees the whole output: an explicit ``</mm:think>`` after a
+    sentinel means the markup was reasoning, so no recovery happens.
+    """
+    parser, _ = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    request = ChatCompletionRequest(messages=[], model="test-model")
+
+    reasoning, content = parser.extract_reasoning(
+        "sketch" + TOOL_BLOCK + "</mm:think>answer", request
+    )
+
+    assert reasoning == "sketch" + TOOL_BLOCK
+    assert content == "answer"

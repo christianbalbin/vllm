@@ -205,6 +205,13 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         regenerates it in the round after the tool result, as it does for any
         normal tool-first round.
 
+        Known divergence: if the model emitted the sentinel inside the block
+        and *then* closed it with ``</mm:think>``, streaming fires the recovery
+        at the sentinel (it cannot look ahead) while non-streaming lets the
+        explicit close win and keeps the markup in reasoning. Unobserved in
+        practice - the sentinel occurs once per response, after the close in
+        every healthy run - and not resolvable without lookahead.
+
         Returns ``(reasoning, content, implicit_end)``.
         """
         split = self._split_at_tool_call_sentinel(reasoning)
@@ -260,7 +267,9 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
 
         head, tail, implicit_end = self._segments_without_explicit_end(reasoning)
         if implicit_end:
-            return head, (content_before + (tail or "")) or None, True
+            # ``tail`` starts with the sentinel, so it is never empty here; the
+            # ``or ""`` only narrows the Optional for the type checker.
+            return head, content_before + (tail or ""), True
         return head, content_before or None, False
 
     def extract_reasoning(

@@ -31,13 +31,6 @@ def _build_union_structural_tag(
     A leading whitespace run is allowed before either branch: the model
     typically emits a newline after the reasoning block, and
     JSONSchemaFormat rejects leading whitespace on its own.
-
-    A trailing whitespace run is allowed after either branch: the model
-    often emits a newline before EOS, and without it the grammar
-    terminates at the closing brace/end tag, so the spec-decode bitmask
-    path probes an already-terminated matcher on every trailing
-    whitespace draft (log spam: "Grammar is terminated, cannot fill
-    bitmask" / rejected token id 10).
     """
     tool_block: dict = {
         "type": "tag",
@@ -67,11 +60,7 @@ def _build_union_structural_tag(
             "type": "structural_tag",
             "format": {
                 "type": "sequence",
-                "elements": [
-                    {"type": "regex", "pattern": "[\\s]*"},
-                    fmt,
-                    {"type": "regex", "pattern": "[\\s]*"},
-                ],
+                "elements": [{"type": "regex", "pattern": "[\\s]*"}, fmt],
             },
         }
     )

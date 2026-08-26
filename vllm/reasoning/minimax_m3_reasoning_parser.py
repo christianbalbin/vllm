@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 # parser's own token): this parser only needs to recognize the marker, never
 # to parse the block, which stays the tool parser's job.
 _TOOL_CALL_START = "]<]minimax[>[<tool_call>"
+_TOOL_CALL_END = "]<]minimax[>[</tool_call>"
 
 
 class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
@@ -164,10 +165,23 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         )
 
     @staticmethod
-    def _split_at_tool_call_sentinel(text: str) -> tuple[str, str] | None:
-        """Split ``text`` at the first tool-call sentinel, or None if absent."""
+    def _split_at_tool_call_sentinel(
+        text: str, *, require_complete: bool = False
+    ) -> tuple[str, str] | None:
+        """Split ``text`` at the first tool-call sentinel, or None if absent.
+
+        ``require_complete`` additionally requires the block's closing tag.
+        Use it where the whole output is already known (the non-streaming
+        path): a block truncated by ``finish_reason: length`` makes the tool
+        parser raise and fall back to returning the raw markup as the answer,
+        which is worse than leaving it in reasoning for the caller to retry.
+        The streaming parser already swallows an incomplete block, so both
+        paths agree - a truncated call yields no content either way.
+        """
         index = text.find(_TOOL_CALL_START)
         if index < 0:
+            return None
+        if require_complete and _TOOL_CALL_END not in text[index:]:
             return None
         return text[:index], text[index:]
 
@@ -265,7 +279,9 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
             if not end:
                 # Unclosed think block: recover a tool call drafted inside it
                 # (see _segments_without_explicit_end).
-                split = self._split_at_tool_call_sentinel(reasoning)
+                split = self._split_at_tool_call_sentinel(
+                    reasoning, require_complete=True
+                )
                 if split is None:
                     return model_output, None
                 self._log_recovery("non-streaming", len(split[0]))
@@ -278,7 +294,9 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         content_before, _, after_start = model_output.partition(self.start_token)
         reasoning, end, content_after = after_start.partition(self.end_token)
         if not end:
-            split = self._split_at_tool_call_sentinel(reasoning)
+            split = self._split_at_tool_call_sentinel(
+                reasoning, require_complete=True
+            )
             if split is None:
                 return reasoning, content_before or None
             self._log_recovery("non-streaming", len(split[0]))

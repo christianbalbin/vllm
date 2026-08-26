@@ -771,3 +771,23 @@ def test_implicit_end_not_inferred_from_prompt_tool_markup():
 
     assert parser.is_reasoning_end(prompt_ids) is False
     assert parser.is_reasoning_end_streaming(prompt_ids, prompt_ids) is False
+
+
+def test_nonstreaming_truncated_tool_call_stays_in_reasoning():
+    """A block cut off by finish_reason=length must not become the answer.
+
+    The tool parser raises on an incomplete M3 block and falls back to
+    returning the raw markup as content, which is worse than an empty answer
+    the caller can retry. The streaming parser swallows an incomplete block on
+    its own, so both paths agree: a truncated call yields no content.
+    """
+    parser, _ = make_tool_markup_parser(
+        chat_template_kwargs={"thinking_mode": "enabled"}
+    )
+    request = ChatCompletionRequest(messages=[], model="test-model")
+
+    truncated = 'draft' + TOOL_CALL_START + '\n]<]minimax[>[<invoke name="render_ch'
+    reasoning, content = parser.extract_reasoning(truncated, request)
+
+    assert content is None
+    assert reasoning == truncated
